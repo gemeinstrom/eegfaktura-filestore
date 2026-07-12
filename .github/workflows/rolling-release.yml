@@ -1,10 +1,9 @@
-# Ziel: ERSETZT die bestehende rolling-release.yml in eegfaktura/eegfaktura-filestore.
-# Unterschied zum aktuellen Stand: zusaetzlicher Job `dispatch-deploy` am Ende,
-# der das Platform-Repo (vfeeg-development/eegfaktura-platform) ueber einen
-# erfolgreichen Build benachrichtigt.
-#
-# Vorbedingung: Repo-Secret `PLATFORM_DEPLOY_PAT` muss gesetzt sein
-# (Classic PAT mit Scope `repo` auf vfeeg-development/eegfaktura-platform).
+# gemeinstrom-Fork-Variante des upstream rolling-release-Workflows.
+# Delta zum Upstream (eegfaktura/eegfaktura-filestore):
+#   - Push nach ghcr.io/gemeinstrom/* statt ghcr.io/vfeeg-development/*
+#   - GITHUB_TOKEN statt VFEEG_DEV_PUSH_PAT (same-org push, keine cross-org-PAT nötig)
+#   - dispatch-deploy Jobs entfernt (Cutover läuft kontrolliert manuell)
+# Aufgesetzt im Rahmen des Cutover-Plans 2026-07-12.
 
 name: Docker Image CI
 
@@ -19,10 +18,7 @@ on:
 
 env:
   REGISTRY: "ghcr.io"
-  # Image landet im Development-Tier (vfeeg-development), nicht im Release-Tier
-  # (eegfaktura). Siehe ADR-0005 im Platform-Repo. Repo-Name bleibt dynamisch,
-  # damit das Template ohne Aenderung in andere Source-Repos uebernehmbar ist.
-  IMAGE_NAME: vfeeg-development/${{ github.event.repository.name }}
+  IMAGE_NAME: gemeinstrom/${{ github.event.repository.name }}
 
 jobs:
   build-and-push-image:
@@ -71,15 +67,12 @@ jobs:
             org.opencontainers.image.repository.url=${{ github.event.repository.html_url || '' }}
 
       - name: Login to Container Registry
-        # Push cross-org nach vfeeg-development/* — GITHUB_TOKEN reicht dafuer
-        # nicht (scope ist auf den source-repo beschraenkt). Nutzen den Classic-PAT
-        # VFEEG_DEV_PUSH_PAT (write:packages auf vfeeg-development, 90-Tage-Expiry).
-        # GHCR validiert via Token, nicht via username — github.actor bleibt.
+        # Same-Org push nach ghcr.io/gemeinstrom/* — GITHUB_TOKEN reicht.
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.VFEEG_DEV_PUSH_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
         id: push
@@ -97,57 +90,3 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-
-  # Triggert das Platform-Repo, damit es den Cluster aktualisiert.
-  # Laeuft nur bei push to default-branch (main/master), nicht bei PRs oder Tags
-  # (Tags loesen vermutlich eine andere, kontrolliertere Release-Pipeline aus).
-  dispatch-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-filestore",
-            "client_payload": {
-              "image_tag": "latest",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched deploy-filestore for sha=${GITHUB_SHA:0:8}"
-
-  # Preview-Deploy (ADR-0007): Push auf preview/** -> pinned Deploy des sha-Builds
-  # in die Dev-Zone, ohne main/Release anzufassen. Nur auf preview/**-Branches.
-  dispatch-preview-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/preview/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger pinned preview deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-filestore",
-            "client_payload": {
-              "mode": "pinned",
-              "image_tag": "sha-${GITHUB_SHA:0:7}",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched pinned preview deploy-filestore for sha-${GITHUB_SHA:0:7}"
