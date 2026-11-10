@@ -14,24 +14,40 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
+import logging
 import os.path
 import typing
 import uuid
 
 import app.dependencies
-from app.file_metadata import allowed_media_types
+from app.file_metadata import allowed_media_types, allowed_file_categories
 from fastapi import UploadFile
 from sqlalchemy import select, delete
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import load_only, selectinload, contains_eager
 
 from app.auth import base_tenant
 from app.config import settings
 
 from app.db.session import get_session
-from app.dependencies import get_valid_data, get_file_download_uri, upload_file, move_file, get_absolute_url
+from app.dependencies import upload_file, move_file, get_absolute_url, discard_files
 from app.graphql.scalars.attribute_scalar import AttributeInput
 from app.models import file_container_model, file_category_model, file_model, file_attribute_model, storage_model
 from app.graphql.scalars.file_scalar import File, AddFile, AddFileError, DeleteFile, DeleteFileError
+
+logger = logging.getLogger(__name__)
+
+
+def _to_file(file: file_model.File, request) -> File:
+    """The GraphQL File of a row loaded with its attributes, container and category."""
+    return File(id=file.id,
+                tenant=file.tenant,
+                user_id=file.user_id,
+                name=file.name,
+                created_at=file.created_at,
+                attributes=file.file_attributes,
+                file_category=file.file_container.file_category.name,
+                file_download_uri=get_absolute_url(f"{settings.HTTP_FILE_DL_BASE_URI}/{file.id}", request))
 
 
 async def get_files(tenant: str, info, attributes: typing.List[AttributeInput], category: str, user_id: uuid.UUID,
@@ -95,17 +111,7 @@ async def get_files(tenant: str, info, attributes: typing.List[AttributeInput], 
         # execute the query
         db_files = (await s.execute(filequery)).scalars()
 
-    file_dicts = []
-    for file in db_files:
-        file_dict = get_valid_data(file, file_model.File)
-        file_dict["attributes"] = file.file_attributes
-        file_dict["file_category"] = file.file_container.file_category.name
-        file_dict["file_download_uri"] = get_absolute_url(f"{settings.HTTP_FILE_DL_BASE_URI}/{file.id}",
-                                                          info.context["request"])
-
-        file_dicts.append(File(**file_dict))
-
-    return file_dicts
+    return [_to_file(file, info.context["request"]) for file in db_files]
 
 
 async def get_file(info, id: uuid.UUID, category: str = ""):
@@ -117,14 +123,16 @@ async def get_file(info, id: uuid.UUID, category: str = ""):
     :return: Specified file
     """
     async with get_session() as s:
+        # joined, so the category filter below applies to this file's category
         filequery = select(file_model.File) \
+            .join(file_model.File.file_container) \
+            .join(file_container_model.FileContainer.file_category) \
             .options(load_only(file_model.File.tenant,
                                file_model.File.user_id,
                                file_model.File.created_at,
                                file_model.File.name),
-                     selectinload(file_model.File.file_container)
-                     .selectinload(file_container_model.FileContainer.file_category)
-                     .options(load_only(file_category_model.FileCategory.name)),
+                     contains_eager(file_model.File.file_container)
+                     .contains_eager(file_container_model.FileContainer.file_category),
                      selectinload(file_model.File.file_attributes)
                      .options(load_only(file_attribute_model.FileAttribute.key,
                                         file_attribute_model.FileAttribute.value))) \
@@ -135,18 +143,9 @@ async def get_file(info, id: uuid.UUID, category: str = ""):
 
         file = (await s.execute(filequery)).scalars().unique().one()
 
-    if file is None:
-        raise Exception("Cant't find file")
-
     info.context["claims"].assert_tenant(file.tenant)
 
-    file_dict = get_valid_data(file, file_model.File)
-    file_dict["attributes"] = file.file_attributes
-    file_dict["file_category"] = file.file_container.file_category.name
-    file_dict["file_download_uri"] = get_absolute_url(f"{settings.HTTP_FILE_DL_BASE_URI}/{file.id}",
-                                                          info.context["request"])
-
-    return File(**file_dict)
+    return _to_file(file, info.context["request"])
 
 
 async def add_file(info, file: UploadFile, name: str, file_category: str, tenant: str,
@@ -162,18 +161,33 @@ async def add_file(info, file: UploadFile, name: str, file_category: str, tenant
         if file.content_type not in allowed_media_types:
             return AddFileError(message="Invalid content_type")
 
+        if file_category not in allowed_file_categories:
+            return AddFileError(message="Invalid file category")
+
+        # Do not allow to override default attributes, and only attributes the table takes (key unique
+        # per file, up to 128 characters, a value up to 512); checked before anything is written (the
+        # upload would otherwise leave its temporary file behind)
+        if name is not None and len(name) > 128:
+            return AddFileError(message="Invalid name: up to 128 characters")
+        keys = set()
+        for attribute in attributes or []:
+            if attribute.key in (['orig_file_name', 'file_extension', 'media_type', 'file_bytes']):
+                return AddFileError(message=f"Forbidden Attribute \"{attribute.key}\"")
+            if len(attribute.key) > 128 or attribute.value is None or len(attribute.value) > 512:
+                return AddFileError(message="Invalid Attribute: key up to 128, value up to 512 characters")
+            if attribute.key in keys:
+                return AddFileError(message=f"Duplicate Attribute \"{attribute.key}\"")
+            keys.add(attribute.key)
+
         async with get_session() as s:
             sql_file_category = select(file_category_model.FileCategory) \
                 .filter(file_category_model.FileCategory.name == file_category)
             db_file_category = (await s.execute(sql_file_category)).scalars().first()
 
             if db_file_category is None:
-                if settings.FILESTORE_CREATE_UNKNOWN_CATEGORY:
-                    db_file_category = file_category_model.FileCategory(name=file_category)
-                    s.add(db_file_category)
-                    await s.flush()
-                else:
-                    return AddFileError(message="Invalid file category")
+                db_file_category = file_category_model.FileCategory(name=file_category)
+                s.add(db_file_category)
+                await s.flush()
 
             file_category_id = db_file_category.id
 
@@ -189,30 +203,25 @@ async def add_file(info, file: UploadFile, name: str, file_category: str, tenant
                 db_storage = None
 
             if db_storage is None:
-                if settings.FILESTORE_CREATE_UNKNOWN_STORAGE:
-                    # create container
-                    db_storage = storage_model.Storage(name=f"Community {tenant} default storage", tenant=tenant)
-                    s.add(db_storage)
-                    await s.flush()
-
-                else:
-                    # Return Error if requested storage does not exist and auto-creation is disabled
-                    return AddFileError(message="No storage for community found")
+                # One storage per tenant: reuse it for a new category, create it on the first upload
+                # of this (already asserted) tenant
+                db_storage = (await s.execute(select(storage_model.Storage)
+                                              .filter(storage_model.Storage.tenant == tenant)
+                                              .order_by(storage_model.Storage.id))).scalars().first()
+            if db_storage is None:
+                db_storage = storage_model.Storage(name=f"Community {tenant} default storage", tenant=tenant)
+                s.add(db_storage)
+                await s.flush()
 
             str_storage_id = str(db_storage.id)
 
             if db_file_container is None:
-                if settings.FILESTORE_CREATE_UNKNOWN_CONTAINER:
-                    db_file_container = file_container_model.FileContainer(
-                        name=f"Community {tenant} default {file_category} container", tenant=tenant,
-                        file_category=db_file_category,
-                        storage=db_storage)
-                    s.add(db_file_container)
-                    await s.flush()
-
-                else:
-                    # Return Error Type if requested container does not exist and auto-creation is disabled
-                    return AddFileError(message="No file Container found")
+                db_file_container = file_container_model.FileContainer(
+                    name=f"Community {tenant} default {file_category} container", tenant=tenant,
+                    file_category=db_file_category,
+                    storage=db_storage)
+                s.add(db_file_container)
+                await s.flush()
 
             str_container_id = str(db_file_container.id)
 
@@ -225,83 +234,56 @@ async def add_file(info, file: UploadFile, name: str, file_category: str, tenant
             await s.flush()
 
             tmpfilename = f"{settings.FILESTORE_TEMP_DIR}/{str(db_file.id)}"
-            await upload_file(file, tmpfilename)
-
-            s.add(file_attribute_model.FileAttribute(file=db_file, key="orig_file_name",
-                                                     value=os.path.splitext(file.filename)[0]))
-            s.add(file_attribute_model.FileAttribute(file=db_file, key="file_extension",
-                                                     value=os.path.splitext(file.filename)[1][1:]))
-            s.add(file_attribute_model.FileAttribute(file=db_file, key="media_type", value=file.content_type))
-
-            # Add extra attributes if set
-            if attributes is not None:
-                for attribute in attributes:
-                    # Do not allow to override default attributes
-                    if attribute.key not in (['orig_file_name', 'file_extension', 'media_type', 'file_bytes']):
-                        s.add(
-                            file_attribute_model.FileAttribute(file=db_file, key=attribute.key, value=attribute.value))
-                    else:
-                        return AddFileError(message=f"Forbidden Attribute \"{attribute.key}\"")
-
             targetfile = f"{settings.FILESTORE_LOCAL_BASE_DIR}/{str_storage_id}/{str_container_id}/{str(db_file.id)}"
-            move_file(tmpfilename, targetfile)
+            # the attribute rows of this file, also returned in the result
+            db_attributes = []
 
-            s.add(file_attribute_model.FileAttribute(file=db_file, key="file_bytes",
-                                                     value=str(os.path.getsize(targetfile))))
+            def add_attribute(key: str, value: str):
+                db_attribute = file_attribute_model.FileAttribute(file=db_file, key=key, value=value)
+                s.add(db_attribute)
+                db_attributes.append(db_attribute)
 
-            await s.commit()
+            try:
+                await upload_file(file, tmpfilename)
 
-        file_dict = db_file.as_dict()
-        file_dict["file_category"] = file_category
-        file_dict["file_download_uri"] = get_absolute_url(f"{settings.HTTP_FILE_DL_BASE_URI}/{db_file.id}",
-                                                          info.context["request"])
+                add_attribute("orig_file_name", os.path.splitext(file.filename)[0])
+                add_attribute("file_extension", os.path.splitext(file.filename)[1][1:])
+                add_attribute("media_type", file.content_type)
 
-        del file_dict["file_container_id"]
-        del file_dict["tenant"]
+                # Add extra attributes if set (the forbidden keys are rejected above)
+                if attributes is not None:
+                    for attribute in attributes:
+                        add_attribute(attribute.key, attribute.value)
 
-        return AddFile(**file_dict)
+                move_file(tmpfilename, targetfile)
+
+                add_attribute("file_bytes", str(os.path.getsize(targetfile)))
+
+            except BaseException:
+                # Nothing is committed yet: leave nothing on disk
+                discard_files(tmpfilename, targetfile)
+                raise
+            try:
+                await s.commit()
+            except DBAPIError as e:
+                # The database refused the rows (the connection is still valid), so no row refers to the file. A lost
+                # connection or any other failure here may still have committed: the file then stays, an orphan at worst
+                if not e.connection_invalidated:
+                    discard_files(tmpfilename, targetfile)
+                raise
+
+        return AddFile(id=db_file.id,
+                       user_id=db_file.user_id,
+                       name=db_file.name,
+                       created_at=db_file.created_at,
+                       attributes=db_attributes,
+                       file_category=file_category,
+                       file_download_uri=get_absolute_url(f"{settings.HTTP_FILE_DL_BASE_URI}/{db_file.id}",
+                                                          info.context["request"]))
 
     except FileNotFoundError as fnfe:
         # TODO Log error
         return AddFileError(message=f"{fnfe.strerror}  {fnfe.filename}")
-
-
-async def get_file_for_category(category: str, id: uuid.UUID, info):
-    """
-    Get file specified by id
-    :param id: File uuid
-    :param info:
-    :return: Specified file
-    """
-    async with get_session() as s:
-        filequery = select(file_model.File) \
-            .options(load_only(file_model.File.tenant,
-                               file_model.File.user_id,
-                               file_model.File.created_at,
-                               file_model.File.name),
-                     selectinload(file_model.File.file_container)
-                     .selectinload(file_container_model.FileContainer.file_category)
-                     .options(load_only(file_category_model.FileCategory.name)),
-                     selectinload(file_model.File.file_attributes)
-                     .options(load_only(file_attribute_model.FileAttribute.key,
-                                        file_attribute_model.FileAttribute.value))) \
-            .filter(file_model.File.id == id) \
-            .filter(file_category_model.FileCategory.name == category)
-
-        file = (await s.execute(filequery)).scalars().unique().one()
-
-    if file is None:
-        raise Exception("Cant't find file")
-
-    info.context["claims"].assert_tenant(file.tenant)
-
-    file_dict = get_valid_data(file, file_model.File)
-    file_dict["attributes"] = file.file_attributes
-    file_dict["file_category"] = file.file_container.file_category.name
-    file_dict["file_download_uri"] = get_absolute_url(f"{settings.HTTP_FILE_DL_BASE_URI}/{file.id}",
-                                                          info.context["request"])
-
-    return File(**file_dict)
 
 
 async def delete_file(info, id: uuid.UUID):
@@ -326,9 +308,12 @@ async def delete_file(info, id: uuid.UUID):
 
         info.context["claims"].assert_tenant(file.tenant)
 
+        # The file lives in its container's storage; a tenant may have more than one storage
         storagequery = select(storage_model.Storage) \
-            .options(load_only(storage_model.Storage.id)).\
-            filter(storage_model.Storage.tenant == file.tenant)
+            .options(load_only(storage_model.Storage.id)) \
+            .join(file_container_model.FileContainer,
+                  file_container_model.FileContainer.storage_id == storage_model.Storage.id) \
+            .filter(file_container_model.FileContainer.id == file.file_container_id)
 
         storage = (await s.execute(storagequery)).scalars().unique().first()
 
@@ -342,7 +327,13 @@ async def delete_file(info, id: uuid.UUID):
         (await s.delete(file))
         (await s.commit())
 
-    # Delete file from Filesystem
-    app.dependencies.delete_file(f"{settings.FILESTORE_LOCAL_BASE_DIR}/{storage.id}/{file.file_container_id}/{file.id}")
+    # Delete file from Filesystem. The row is gone already: a file that is missing on disk counts as deleted and is
+    # logged (ids only); any other error (e.g. no permission) is still reported to the client
+    try:
+        app.dependencies.delete_file(
+            f"{settings.FILESTORE_LOCAL_BASE_DIR}/{storage.id}/{file.file_container_id}/{file.id}")
+    except FileNotFoundError as e:
+        logger.warning("deleteFile: file %s (storage %s, container %s) not removed from disk: %s",
+                       file.id, storage.id, file.file_container_id, type(e).__name__)
 
     return DeleteFile(id=file.id)

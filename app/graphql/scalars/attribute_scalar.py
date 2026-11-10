@@ -15,10 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
-import uuid
-
 import strawberry
-from pydantic import Field
 import typing
 
 
@@ -31,29 +28,3 @@ class Attribute:
 class AttributeInput:
     key: str
     value: typing.Optional[str] = ""
-
-@strawberry.type
-class AddAttribute:
-    file_id: uuid.UUID
-    key: str
-    value: typing.Optional[str] = ""
-
-
-@strawberry.type
-class AttributeNotFound:
-    message: str = "Attribute not found"
-
-
-@strawberry.type
-class FileIdMissing:
-    message: str = "Required file id is missing"
-
-
-@strawberry.type
-class KeyMissing:
-    message: str = "Required key is missing"
-
-
-@strawberry.type
-class AttributeDeleted:
-    message: str = "Attribute successfully deleted"

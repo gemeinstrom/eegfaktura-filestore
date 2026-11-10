@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-from typing import List
 
 import strawberry
 import uuid
@@ -26,12 +25,6 @@ from strawberry.file_uploads import Upload
 from app.graphql.scalars.attribute_scalar import AttributeInput
 from app.graphql.scalars.file_scalar import AddFileResponse, DeleteFileResponse
 from app.graphql.resolvers.file_resolver import add_file, delete_file
-
-# TODO implement isAuthenticated Class
-# https://strawberry.rocks/docs/guides/permissions#accessing-user-information
-
-
-import strawberry
 
 
 @strawberry.type

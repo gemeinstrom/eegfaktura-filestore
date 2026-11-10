@@ -8,6 +8,195 @@ this changelog highlights the changes relevant for overview and operations.
 
 ## [Unreleased]
 
+### Changed
+- **CI: no image build for a commit that only changes `CHANGELOG.md`** (platform#239): pushes and pull requests whose
+  only change is the CHANGELOG, such as the release PR, skip the image build and the checks (PR checks, security
+  scan, Snyk Code; the weekly schedules still run). Tag pushes still build. A release promotes
+  the image of the last commit before the release PR; it has the same content.
+
+## [1.2.0] – 2026-11-06
+
+### Security
+- **Base image `python:3.13-slim-trixie`** instead of `-bookworm`: removes CVE-2023-45853 (zlib) and CVE-2025-7458
+  (sqlite), neither of which has a fix in bookworm. libpq moves from 15 to 17; the database server is unchanged.
+
+### Added
+- **Never-log test** (eegfaktura-dev#45 L11, Q2, `tests/test_never_log.py`, no new dependency): scans the source (`app/`, `main.py`, `alembic/`) and fails the suite on a log call that names personal data or secrets, uses `%r`/`!r`, or writes a value it cannot show to be a literal, an id or a class name. Names are split into words (snake_case, camelCase, the dots of an access) and compared as whole words against the word list all services share, also with a plural `s` (`tokens`, `IBANs`); in an all lower-case name a list word of five or more letters also matches inside it (`accesstoken`). Message text is not scanned for words, except a list word directly before a placeholder of a format string or f-string (`"password=%s"`, `f"iban {x}"`). The stricter scan finds nothing in the source. A legitimate exception needs an entry (file and finding) with its reason in the test's `ALLOWED`; there is none: the two former ones are fixed at the call site (see Changed).
+
+- **Tests pin the request's fields on every line of a request** (eegfaktura-dev#45 L12): `request.id` and, after a passed tenant check, `tenant.id` were already on all lines through `log_context`; the tests cover the application lines of REST and GraphQL, the GraphQL error line, the JWT refusal and the line of an unhandled error. No change in the service.
+
+- **`deployment.environment` on every log line** (eegfaktura-dev#45 L14) from the new optional environment variable `DEPLOYMENT_ENVIRONMENT`; the value is trimmed, and the field is left out when the variable is not set or blank. The deployments set it separately (gitops).
+
+### Changed
+- **One start-up line** (eegfaktura-dev#45 L14, Q4): `service start` with `event.action=service.start`, `log.effective_level` and the `service.version` every line has, at info whatever `LOG_LEVEL` says, replaces `Starting uvicorn server...` (which a level above info hid). No other setting, no secrets.
+- **`tenant.id` follows the rule of all services** (eegfaktura-dev#45, review of #66): the checked stem, stripped and upper-cased, is written only when it matches `^[A-Z0-9][A-Z0-9_-]{0,63}$`, enforced in one place (`record_tenant_check`) for the superuser and the token-granted check alike. Before, a superuser's value had to look like `RC100181` (two letters, six digits) and a token-granted value was written unchecked. A GEA tenant `GC123456-001` is still logged as its stem `GC123456`.
+- **`error.type` is the fully qualified class name** (eegfaktura-dev#45 Q5, the rule of all services): module and qualified name, e.g. `sqlalchemy.exc.OperationalError`, `fastapi.exceptions.HTTPException`, `builtins.KeyError`, instead of the bare class name — on exception lines and on the GraphQL error line. A Dynatrace filter on the bare name needs the new value.
+- **The access line is written at `LOG_LEVEL=warn` and `error` too** (eegfaktura-dev#45 Q4): the loggers `app.access` and `app.start` have level info of their own, as in billing; before, a level above info hid the access line.
+- **The failed readiness line names only the exception class** (eegfaktura-dev#45 L11, found by the never-log test): `readiness check failed: database not reachable: ConnectionRefusedError` instead of the exception's repr, which can carry host and database user.
+- **The JWT refusal and the missing-file line name no free text and no path** (eegfaktura-dev#45 Q2): `JWT decode failed: <exception class>` without PyJWT's message; `download: file missing on disk: storage <id>, container <id>, file <id>` instead of the on-disk path with the configured base directory.
+- **Logging and database settings are read from the environment by pydantic only** (eegfaktura-dev#45 Q3): `LOG_LEVEL` (with the `APP_LOG_LEVEL` fallback), `LOG_FORMAT`, `SERVICE_VERSION`, `DEPLOYMENT_ENVIRONMENT` and `DB_*` no longer have `os.environ` defaults evaluated at import; `DB_DSN` is built from the `DB_*` settings and is no longer an environment variable of its own (no deployment set it). An empty `DB_PORT` now means the default 5432 instead of stopping the import. `configure_logging` takes the settings.
+
+### Fixed
+- **A failed migration stops the container** (eegfaktura-dev#45 Q1, tracking filestore 261103-mm1): `entrypoint.sh` ran `alembic upgrade head` without checking it and then started the server on the unmigrated database. It now runs with `set -euo pipefail` and `exec`s the server, which as PID 1 gets the container's SIGTERM. An exception nothing catches (alembic not reaching the database, a bad JWT key file at start) is written as one line through the logging setup (`log.logger=app.uncaught`, with `error.type`, `error.message` — the reason, e.g. why the migration failed — and `error.stack_trace`) instead of a plain traceback on stderr. Not covered: an error before the logging setup is applied (settings validation, an unknown `LOG_LEVEL`/`LOG_FORMAT`) still goes to stderr as a plain traceback as before; `KeyboardInterrupt` and other non-`Exception` exits go to Python's default hook.
+- **No SQL parameters in the log** (eegfaktura-dev#45 L7): an unhandled database error on a REST upload or download wrote the statement's values (user id, file name) into `error.message` and `error.stack_trace`. Both SQLAlchemy engines (application, Alembic) now run with `hide_parameters=True`; the statement and the database's reason stay in the line.
+- **GraphQL `contract(id)` and `invoice(id)` check the file's own category** (code-quality review FS-CQ-3): the query filtered on the category name without joining the file's category, so `invoice(id: <contract file>)` returned the contract file (same tenant only; the tenant check was not affected). A file of the other category is now not found: `null` with an entry in `errors`, as for an unknown id. `file(id)` is unchanged. Not used by eegfaktura-web.
+- **GraphQL `addFile` result: `userId` and `attributes`** (FS-CQ-4): `userId` was always `""`, now it is the stored user id (`null` when none was given); selecting `attributes` failed with "Expected Iterable", now it returns the stored attributes (the default ones and those given). eegfaktura-web selects `userId` but does not use it from the upload result.
+
+### Removed
+- **Unused code** (code-quality review 2026-11-03, FS-CQ-2, -5, -6, -15, -18, -21, -22, -23): an unused copy of the file query, 13 unused GraphQL types (not in the schema; the printed schema is unchanged), unused helpers in `app/dependencies.py`, the never-read settings `APP_TITLE`/`APP_VERSION` and the image label `version="0.1.0"`, `Claims.preferred_username`, commented-out code and stale TODOs. A swallowed exception when building a GraphQL `File` is gone (FS-CQ-8: the fields are set explicitly). The OpenAPI document now shows the description of the download's 404 response (key typo). README names Python 3.13. `alembic.ini` sets `path_separator` (no deprecation warning). No change for clients.
+
+## [1.1.0] – 2026-10-31
+
+### Added
+- **Health endpoints for Kubernetes probes:** `GET /healthz` (liveness, always `200 ok`, no dependency checks) and `GET /readyz` (readiness: `SELECT 1` on a database connection of its own, not from the application pool, with 2 s connect and statement timeouts; one ping at a time, concurrent calls and calls within 1 s share its result; `200 ok`, otherwise `503 unavailable`, reason logged at warn level; Postgres refusing the ping with `too_many_connections` (53300) counts as ready, since the application pool still serves). Plain text, without a bearer token (the documented exception), on the HTTP port (5000); requests of Kubernetes probes (User-Agent `kube-probe/…`) are left out of the access log.
+- **Structured logging (JSON) and an own access line** (eegfaktura-dev logging concept W-261008-ca2, open point FS-3; partly tracking filestore 261008-ca1: the loggers had no handler). **This changes what operators and Dynatrace receive from the filestore:**
+  - One logging setup for the service (`app/logging_config.py`), applied at start to the application's, uvicorn's and alembic's (migration at container start) loggers. In the image every line is now **one JSON object on stdout** with ECS field names: `@timestamp` (UTC, ms), `log.level` (`trace`/`debug`/`info`/`warn`/`error`), `log.logger`, `service.name` (`eegfaktura-filestore`), `service.version`, `message`, and per request `request.id`, `trace.id`/`span.id` (from a W3C `traceparent`), `tenant.id`, `client.id` (the token's `azp`, the Keycloak client — not a person), `graphql.operation.name`; exceptions as `error.type`/`error.message`/`error.stack_trace` in the same line. Only these fields are written.
+  - New environment variables: `LOG_LEVEL` (default `info`; `trace`, `debug`, `info`, `warn`, `error`; **an unknown value stops the start**, an empty one means the default), `LOG_FORMAT` (`json`, set in the image; `text` is the default when run from source), `SERVICE_VERSION` (set by the release build: the version for a `v*` tag, otherwise the commit; `dev` when not built by CI. A promoted prod/pilot image keeps its commit: the release version is the image tag). The former `APP_LOG_LEVEL` was never read; it is now read as a fallback when `LOG_LEVEL` is not set. The image no longer sets `APP_LOG_LEVEL=debug`. **Prod gitops sets `APP_LOG_LEVEL: "debug"` (`base/cm-filestore-config.yaml`), so without a gitops change prod would now log at debug** — the gitops change to `APP_LOG_LEVEL: "info"` is prepared separately (vfeeg-development/eegfaktura-gitops#160) and must go out with the prod release of this version; pilot already sets `info`. Even at `trace`, uvicorn's connection lines (client IP and port) stay out.
+  - **Access line:** uvicorn's access log (client IP and raw path with query) is replaced by one line per request, `event.action=http.access`, written after the request with the route template (`http.route`, e.g. `/filestore/{file_id}`, no ids, no query), `http.request.method`, `http.response.status_code`, `event.duration` (nanoseconds, ECS), `event.outcome` (`success`, `refused` for 401/403 and for a refused tenant check inside GraphQL, which answers 200, `failure`), `request.id` (the caller's `X-Request-Id` when it is a plain token of up to 128 characters, otherwise generated; returned as response header `X-Request-Id`, except on a 500 from an unhandled error), `tenant.id` (the checked tenant stem, upper-case, e.g. `GC106668` for `GC106668-003`, only after a passed check; left out when a request has a refused check or several tenants; for a superuser only when the value has the form of a tenant id) and `client.id`. No user id, name, e-mail, user agent or IP (no user tracking). Kubernetes probe requests to `/healthz`/`/readyz` stay out of it, as before.
+  - Known limits: a 500 from an unhandled error carries no `X-Request-Id` header (the traceback line still has `request.id`); the status is taken when the response starts, so a download that fails mid-stream is still logged as 200/`success`.
+  - The `print` of a missing file's path on download and the start message now go through the logger; the unused `logging.yaml` and the logging sections of `alembic.ini` are removed.
+
+### Security
+- **CI: the release workflow pins its actions by commit SHA** (eegfaktura-dev tracking W-261028-mm6). `rolling-release.yml`
+  builds and pushes the shipped image, but used floating tags (`@v4`, `@v3`, …); a moved tag ran in the job that holds
+  the push credentials. Now every action is pinned to a commit, the same SHAs `pr-checks.yml` and `security-scan.yml` already
+  use where the action is the same, otherwise the commit the floating tag pointed to on 2026-10-28.
+- `certifi` 2026.7.22 → 2026.10.19 and `graphql-core` 3.2.11 → 3.2.12 (Dependabot).
+
+### Fixed
+- **`service.version` in the log names the build.** Images built from a branch carried the branch name (`main`), which cannot tell builds apart, and a promoted prod/pilot image keeps what was set at build time. It is now the commit, or the version without `v` for a `v*` tag build; same as billing.
+- **GraphQL error logging** (eegfaktura-dev tracking filestore 261030-mm1): security relevant — details not published. GraphQL errors are now logged as `GraphQL error` with `error.type` and `graphql.error.path` only; a refused tenant check at warn level without a stack trace.
+- **JWT key file** (eegfaktura-dev tracking filestore 16): security relevant — details not published.
+- **A failed upload no longer leaves its file on disk** (eegfaktura-dev tracking filestore 261005-ca1). GraphQL `addFile` rejects duplicate attribute keys, keys over 128 and values over 512 characters (or without a value) with an `AddFileError` before anything is written; formerly the database refused them at the commit, after the file had been moved into place. When the commit of an upload fails anyway (REST or GraphQL, e.g. a file extension over 512 characters), the stored and the temporary file are removed.
+- **`deleteFile` no longer fails after the row is gone** (eegfaktura-dev tracking filestore 3). The row is deleted first; when the file is already missing on disk afterwards, the mutation now answers `DeleteFile` instead of an error and logs it with ids only. Any other error removing the file is still reported.
+
+## [1.0.9] – 2026-10-28
+
+### Security
+- **Slim runtime image** (prod image scan 2026-10-28): `gcc`, `libc6-dev` and `libpq-dev` (with `libssl-dev` and
+  the other header packages they pull in) were installed in the runtime image to build `psycopg2`. The Dockerfile
+  now has a build stage that installs the Python packages into a virtualenv (`/opt/venv`); the runtime stage (same
+  `python:3.13-slim-bookworm`) copies that venv and installs only `libpq5`. The base image's own pip is removed (it
+  was upgraded before; `pip` is now the upgraded one in the venv). `entrypoint.sh`, `alembic` and `python3` are
+  found through `PATH` (`/opt/venv/bin` first); working directory, user `app` (1000), environment, port and command
+  are unchanged.
+
+### Fixed
+- **CI: the Snyk Code scan fails visibly when it cannot run.** An invalid `SNYK_TOKEN` ended the weekly and
+  push scan green without any result (`continue-on-error`); now only „issues found“ keeps the run green (the
+  issues go to Code Scanning), an authentication or tool error fails it. The Snyk CLI is pinned to 1.1308.1
+  instead of the latest version.
+
+## [1.0.8] – 2026-10-25
+
+### Security
+- strawberry-graphql 0.320.0 → 0.327.2: closes PYSEC-2026-4303 (fixed in 0.326.1, the Trivy
+  HIGH finding; a permission check returning an awaitable from a plain `def` passed as allowed)
+  and PYSEC-2026-4302 (fixed in 0.327.2, found by pip-audit). The filestore uses no strawberry
+  permission classes, and the breaking changes in between (removed `Extension` alias, schema
+  directives, cache extension defaults, graphql-ws subscriptions) touch no API it uses. One
+  visible change: since 0.322.1 a non-string variable value for a `UUID` argument (e.g.
+  `file_id`, `user_id`) gets a standard GraphQL coercion error instead of an unhandled server
+  error. strawberry 0.323.1 raised its minimum typing-extensions to 4.14.0; the pinned 4.15.0
+  satisfies it, so no other pin changes. (platform#185)
+
+## [1.0.7] – 2026-10-21
+
+### Added
+- Tests: a token with a wrong `aud` gets 401; a token with the realm role `superuser` reaches another
+  tenant's files (download, list, upload); GEA sub-community tenants (`GCxxxxxx-00n`) and their stem
+  (`GCxxxxxx`) reach the same files in both directions, another stem gets 403. (platform#185)
+- Test: an HS256 token signed with the RS256 public key as HMAC secret (algorithm confusion) gets
+  401. The test switches off PyJWT's own refusal of PEM keys as HMAC secrets, so it fails as soon as
+  `get_claims` accepts HS256; the former HS256 test used an unrelated secret and would have passed
+  either way. (platform#185)
+- CI: the full job runs `alembic check` after `alembic upgrade head`. (platform#185)
+- Tests (`tests/`, pytest with FastAPI's TestClient against the migrated PostgreSQL, run by the CI
+  full job): requests without or with an invalid token (no `exp`, expired, HS256) get 401; a token
+  of another tenant cannot upload, download or list (403); only the categories `contract` and
+  `invoice` are accepted (REST and GraphQL); upload and download for the own tenant. Test
+  dependencies are pinned in `requirements-test.txt`; the tests generate their own RSA keypair.
+  (platform#185)
+- CI: job "Lint" runs ruff with bug-finding rules only (`F`, `E7`, `B`; `ruff.toml`) and blocks.
+  Its findings are fixed: unused and duplicate imports removed, a stray expression statement
+  (`0`) removed, bare `except` → `except Exception`, `caching == True` → `caching`, and the two
+  re-raised `HTTPException`s chain their cause (`from e`). No behaviour change. (platform#185)
+- CI: `pr-checks.yml` on every pull request: byte-compile and import (unit), Alembic
+  migrations against PostgreSQL and an application start (full); a check that requirements.txt pins
+  every dependency (report-only at first, now blocking, see below).
+- CI: `security-scan.yml` on every pull request, on pushes to the default branch and weekly:
+  leaked secrets in the new commits (Gitleaks, Trivy), vulnerable dependencies (Trivy,
+  OSV-Scanner) and misconfigurations (Trivy). For now the dependency and misconfiguration
+  findings are only reported (`SCAN_FAIL_ON: none`) and do not block; leaked secrets fail.
+- CI: every run keeps its scan and test results as artifacts for 30 days (`scan-*`,
+  `test-results-<job>`, `known-errors-<job>`) for a CI report collector; the secret scan keeps
+  outcomes and counts only.
+
+### Changed
+- CI full job and the local `docker-compose.yml` database: PostgreSQL 18.6 (`postgres:18.6-alpine`,
+  pinned by digest) instead of 15.19 / `15-alpine`, the major all zones run; the workflow comment
+  no longer calls 15 the production major. The compose volume is now mounted at
+  `/var/lib/postgresql` (as the 18 image requires); a local volume with 15 data is not upgraded,
+  recreate it (`docker compose down -v`; the database container does not start on the old volume, and `down -v` deletes its data — dump it first if needed). (platform#185)
+- Image: no empty `DB_PASSWORD` default in the image environment any more (Trivy DS-0031); the
+  password still comes from `DB_PASSWORD` (as in the gitops manifests) or `DB_PASSWORD_FILE`, which
+  the entrypoint now exports. apt installs without recommended packages (DS-0029); `libc6-dev`,
+  until now pulled in as a recommendation of `gcc`, is named explicitly. (platform#185)
+- `requirements.txt` pins the transitive dependencies too, at the versions the image installed so
+  far (the installed set is unchanged). The CI check "Requirements pinned" now blocks; its output
+  artifact is `test-results-requirements` (was `known-errors-requirements`). (platform#185)
+
+### Fixed
+- GraphQL `addFile` with a default attribute key (`orig_file_name`, `file_extension`, `media_type`,
+  `file_bytes`) in `attributes` is rejected before anything is written: no temporary file is left
+  in `FILESTORE_TEMP_DIR` any more. The client gets the same error ("Forbidden Attribute"); the
+  file row was already rolled back before. (platform#185)
+- `alembic check` no longer reports four foreign keys as changed. The online migration environment
+  now compares only the `filestore` schema, with the version table named as in the offline one
+  (`filestore.alembic_version`, where it already was); the migrations themselves are unchanged.
+  (platform#185)
+
+## [1.0.6] – 2026-10-17
+
+### Changed
+- **File categories are a fixed list** (`contract`, `invoice`). A GraphQL upload with any other
+  category is rejected ("Invalid file category"); before, it created a new global category when
+  `FILESTORE_CREATE_UNKNOWN_CATEGORY` was on (it was on in production). The REST upload was already
+  limited to these two.
+- **Storage and container of a tenant are created on its first upload without a switch.** The
+  tenant is asserted first, so a member token can only create its own community's storage (a
+  superuser passes the check for any tenant, as before). This is what production already did with
+  the flags on; with the flags off, the first upload of a new community failed.
+
+### Fixed
+- **The first upload of a new category no longer creates a second storage for the tenant.** The
+  storage was only looked up through an existing container of the same category, so e.g. a first
+  invoice next to existing contracts created another storage. Now the tenant's storage is reused
+  (lowest id, so the choice is stable also for tenants that already have several).
+- **Deleting a file uses the storage of the file's container.** It looked the storage up by tenant
+  only; for a tenant with several storages it could build a wrong path, delete the DB row and leave
+  the file on disk.
+- **REST upload (`POST /filestore/upload/…`) no longer answers 500 after storing the file.** It
+  removed a key `community_id` that no longer exists since the tenant rename; a client retrying on
+  5xx stored the document again. Containers created via REST no longer carry the enum class name in
+  their name.
+
+### Removed
+- Environment variables `FILESTORE_CREATE_UNKNOWN_CATEGORY`, `_CONTAINER` and `_STORAGE`. They are
+  ignored if still set; remove them from deployments.
+
+## [1.0.5] – 2026-10-17
+
+### Fixed
+- **Uploads into a new storage or container work again under the non-root image.** Since 1.0.4 the
+  service runs as UID 1000 and created new directories with mode `0o660` (no x bit), so it could not
+  enter them: the first upload into every new storage/container failed with `Permission denied`
+  (production: 17 uploads between 09.10. and 16.10.2026). New directories are now created with `0o750`.
+  Directories already created with `0o660` stay broken until fixed once on the volume
+  (`find <data> -mindepth 1 -type d ! -perm -u+x -exec chmod 750 {} +`).
+
+## [1.0.4] – 2026-10-04
+
 ### Security
 - The image runs as a non-root user (`app`, UID/GID 1000) on a `python:3.13-slim-bookworm` base,
   and the JWT public key is no longer baked into the image. The data PVC therefore needs
